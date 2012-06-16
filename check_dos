@@ -1,0 +1,139 @@
+#!/bin/bash
+
+while getopts "w:c:" opt; do
+  case $opt in
+    w)
+      warning="$OPTARG"
+    ;;
+    c)
+      critical="$OPTARG"
+    ;;
+  esac
+done
+
+if [ -z "$warning" ]; then
+  echo 'Specify the -w (warning) argument' 1>&2
+  exit 3
+fi
+if [ -z "$critical" ]; then
+  echo 'Specify the -c (critical) argument' 1>&2
+  exit 3
+fi
+
+
+# config variables
+warning_avg_packet_size="$warning"
+critical_avg_packet_size="$critical"
+minimal_data_per_sec=500000
+packet_log="/root/packet_log"
+last_log="/tmp/last_log"
+
+if [ -f "$last_log" ]; then
+  time_cycle="$(( $(date +%s) - $(stat -c "%Y" "$last_log") ))"
+else
+  time_cycle=5
+fi
+
+xls_temp="$(mktemp)"
+last_log_temp="$(mktemp)"
+result_temp="$(mktemp)"
+rx_packets=0
+rx_bytes=0
+tx_packets=0
+tx_bytes=0
+
+minimal_data="$(( $minimal_data_per_sec * $time_cycle ))"
+
+xenstore-ls | grep -e ' vif = "[^"]' -e vif-uuid | perl -pn000 -e 's/\n[ ]+vif-uuid//g' | sed -r 's/.*(vif[^"]+)[= "]+([a-f0-9-]+).*/\1 \2/' > "$xls_temp"
+
+echo "$(date)" >> "$packet_log"
+echo "--------------------------------------------------------" >> "$packet_log"
+
+output=""
+
+ifconfig | 
+    grep -e 'Link encap:Ethernet' -e 'RX bytes' -e 'RX packets' -e 'TX packets' | 
+    perl -pn000 -e 's/(Ethernet|errors:).*\n/ /g' |
+    grep ^vif |
+    sed -r 's/(vif[0-9.]+).*?:([0-9]+).*?:([0-9]+).*?:([0-9]+).*?:([0-9]+).*/\1 \2 \4 \3 \5 /' > "$result_temp"
+while read i; do
+  row=( $i )
+
+  vif_id=${row[0]}    
+
+  new_rx_packets=${row[1]}
+  new_rx_bytes=${row[2]}  
+  new_tx_packets=${row[3]}
+  new_tx_bytes=${row[4]}
+
+  old_row="$(cat "$last_log" | grep "^$vif_id")"
+  old_row=( $old_row )
+
+  if [ -n "$old_row" ]; then
+    rx_bytes=$(( $new_rx_bytes - ${old_row[1]} )) 
+    rx_packets=$(( $new_rx_packets - ${old_row[2]} )) 
+    tx_bytes=$(( $new_tx_bytes - ${old_row[3]} )) 
+    tx_packets=$(( $new_tx_packets - ${old_row[4]} )) 
+
+    if [ "$rx_packets" -eq "0" ]; then  
+      rx_rate=0
+    else
+      rx_rate=$(( $rx_bytes / $rx_packets ))    
+    fi
+    if [ "$tx_packets" -eq "0" ]; then
+      tx_rate=0
+    else
+      tx_rate=$(( $tx_bytes / $tx_packets ))
+    fi
+
+    vif_uuid="$(cat "$xls_temp" | grep ^$vif_id | cut -d ' ' -f 2)"
+    vm_name="$(xe vif-list params=vm-name-label --minimal uuid=$vif_uuid)"
+    log_row="VM:${vm_name} RX:${rx_bytes}/${rx_packets}=${rx_rate} TX:${tx_bytes}/${tx_packets}=${tx_rate}" 
+
+    if [ "$rx_bytes" -gt "$minimal_data" ]; then
+      if [ "$rx_rate" -lt "$critical_avg_packet_size" ]; then
+        output="${output} | CRITICAL ${log_row}"
+      else
+        if [ "$rx_rate" -lt "$warning_avg_packet_size" ]; then
+          output="${output} | WARNING ${log_row}"
+        fi    
+      fi
+    fi
+    if [ "$tx_bytes" -gt "$minimal_data" ]; then
+      if [ "$tx_rate" -lt "$critical_avg_packet_size" ]; then
+        output="${output} | CRITICAL ${log_row}"
+      else
+        if [ "$tx_rate" -lt "$warning_avg_packet_size" ]; then
+          output="${output} | WARNING ${log_row}"
+        fi  
+      fi
+    fi
+      
+
+    echo "$log_row" >> "$packet_log"  
+  fi
+  echo "${vif_id} ${new_rx_bytes} ${new_rx_packets} ${new_tx_bytes} ${new_tx_packets}" >> "$last_log_temp"
+done < "$result_temp"
+
+rm -f "$result_temp"
+
+mv "$last_log_temp" "$last_log"
+
+echo "" >> "$packet_log"
+
+rm -f "$xls_temp"
+
+if echo "$output" | grep -q "CRITICAL"; then
+  echo "DOS_DETECT CRITICAL ${output}"
+  exit 2
+fi
+
+if echo "$output" | grep -q "WARNING"; then
+  echo "DOS_DETECT WARNING ${output}"
+  exit 1
+fi
+
+echo "DOS_DETECT OK"
+exit 0
+
+
