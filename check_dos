@@ -25,7 +25,7 @@ fi
 warning_avg_packet_size="$warning"
 critical_avg_packet_size="$critical"
 minimal_data_per_sec=500000
-packet_log="/root/packet_log"
+packet_log="/var/log/network_usage.log"
 last_log="/tmp/last_log"
 
 if [ -f "$last_log" ]; then
